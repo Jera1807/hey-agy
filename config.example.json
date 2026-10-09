@@ -1,0 +1,9 @@
+{
+  "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
+  "gemini_model": "models/gemini-3.5-transcribe-live",
+  "gemini_fallback_model": "models/gemini-3.5-transcribe",
+  "wake_word": "Hey Agy",
+  "silence_duration_seconds": 1.4,
+  "ipc_port": 8765,
+  "auto_send": true
+}

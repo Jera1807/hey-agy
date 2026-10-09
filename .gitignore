@@ -1,0 +1,27 @@
+# Secret configuration containing API keys
+config.json
+
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Python byte-code and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Local Vosk models (if downloaded locally into directory)
+model/
+vosk-model-*/
+
+# Temporary audio files and logs
+*.wav
+*.pcm
+*.log
+
+# Editor / IDE configurations
+.vscode/
+.idea/
+*.swp
