@@ -223,9 +223,9 @@ class VoiceEngine:
         return None
 
     def handle_stop_command(self):
-        """Bricht einen laufenden Task / Generierung hands-free per Ctrl+C ab."""
+        """Bricht einen laufenden Task / Generierung in Antigravity hands-free per Escape ab."""
         print("\n" + "=" * 55)
-        print(" [!] 'Stop Agy' erkannt! Sende Abbruch (Ctrl+C)...")
+        print(" [!] 'Stop Agy' erkannt! Sende Abbruch (Escape)...")
         print("=" * 55)
         self.chime_cancel()
 
@@ -245,10 +245,9 @@ class VoiceEngine:
             except Exception:
                 pass
 
-        pyautogui.keyDown('ctrl')
-        pyautogui.press('c')
-        pyautogui.keyUp('ctrl')
-        print("[+] Abbruch-Signal (Ctrl+C) erfolgreich gesendet.\n")
+        # In Antigravity CLI wird ein aktiver Task/Generierung sauber mit Escape abgebrochen
+        pyautogui.press('escape')
+        print("[+] Abbruch-Signal (Escape) erfolgreich gesendet.\n")
 
     async def transcribe_live_api(self, audio_bytes: bytes, sample_rate: int = 16000) -> str:
         api_key = self.config.get("gemini_api_key")

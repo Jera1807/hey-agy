@@ -34,7 +34,7 @@ python path/to/antigravity-voice/voice_client.py status
 ```
 
 ### 5. `/voice stop` or `/voice cancel` (Abort Active Task)
-Sends a virtual Ctrl+C interrupt signal to the active Antigravity terminal session.
+Sends a virtual Escape interrupt signal to the active Antigravity terminal session.
 ```powershell
 python path/to/antigravity-voice/voice_client.py stop
 ```

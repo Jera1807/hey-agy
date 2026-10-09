@@ -16,7 +16,7 @@
 - **🗣️ Local, Free & Open-Source Wake Word ("Hey Agy"):**  
   Powered by an offline Vosk/Kaldi phoneme engine with strict **Grammar-Lock**. Zero account signups, zero paid subscriptions, and zero false positives during everyday German or English office conversations.
 - **🛑 Hands-Free Stop / Abort ("Stop Agy" / "Cancel"):**  
-  Need to interrupt a running code generation or command immediately? Just say *"Stop Agy"* or *"Hey Agy Stop"* – the daemon sends an instant virtual `Ctrl+C` interrupt signal directly to the session terminal.
+  Need to interrupt a running code generation or command immediately? Just say *"Stop Agy"* or *"Hey Agy Stop"* – the daemon sends an instant virtual `Escape` interrupt signal directly to the session terminal.
 - **⚡ Ultra-Low-Latency Transcription:**  
   Streams microphone audio over WebSockets directly to Google's **Gemini 3.5 Transcribe Live** (`models/gemini-3.5-transcribe-live`). Transcriptions complete in milliseconds with automatic developer-context cleaning.
 - **🧠 Smart Window Focus Memory:**  
@@ -127,7 +127,7 @@ You can then control the daemon without leaving your Antigravity session:
 
 | Slash Command | Action |
 | :--- | :--- |
-| `/voice stop` | Sends Ctrl+C interrupt signal to cancel the running task/generation. |
+| `/voice stop` | Sends Escape interrupt signal to cancel the running task/generation. |
 | `/voice off` | Mutes wake-word listening (ideal for team calls or YouTube videos). |
 | `/voice on` | Resumes active listening for *"Hey Agy"*. |
 | `/dictate` | Triggers a one-shot recording immediately without saying the wake word. |
