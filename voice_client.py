@@ -30,9 +30,12 @@ def main():
     if cmd in ["on", "start", "unmute"]:
         res = send_command("unmute")
         print("✅ Wake-Word aktiviert. Antigravity hört auf das Codewort.")
-    elif cmd in ["off", "stop", "mute"]:
+    elif cmd in ["off", "mute"]:
         res = send_command("mute")
         print("🔇 Wake-Word stummgeschaltet (Mute-Modus aktiv).")
+    elif cmd in ["stop", "cancel", "abort"]:
+        res = send_command("stop")
+        print("🛑 Abbruch-Signal (Ctrl+C) an Antigravity gesendet.")
     elif cmd in ["dictate", "listen", "record"]:
         res = send_command("dictate")
         print("🎙️ Aufnahme gestartet! Sprich jetzt deinen Prompt...")

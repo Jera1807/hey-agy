@@ -75,12 +75,59 @@ def get_antigravity_sessions():
             pass
     return sessions
 
+SOUNDS_DIR = os.path.join(os.path.dirname(__file__), "sounds")
+
+def ensure_sound_effects():
+    """Erstellt hochwertige WAV-Chimes (harmonische Sinus-Wellen mit exponentiellem Decay), falls nicht vorhanden."""
+    os.makedirs(SOUNDS_DIR, exist_ok=True)
+    def make_chime(filename, freqs, durations, sample_rate=44100):
+        path = os.path.join(SOUNDS_DIR, filename)
+        if os.path.exists(path):
+            return path
+        audio = []
+        for f, d in zip(freqs, durations):
+            n = int(sample_rate * d)
+            t = np.linspace(0, d, n, False)
+            wave_data = np.sin(2 * np.pi * f * t) + 0.2 * np.sin(4 * np.pi * f * t)
+            attack = int(sample_rate * 0.01)
+            decay = n - attack
+            env = np.ones(n)
+            if attack > 0:
+                env[:attack] = np.linspace(0, 1, attack)
+            env[attack:] = np.exp(-3.5 * np.linspace(0, 1, decay))
+            audio.append(wave_data * env)
+        full = np.concatenate(audio)
+        full = (full / np.max(np.abs(full)) * 28000).astype(np.int16)
+        with wave.open(path, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(full.tobytes())
+        return path
+
+    return {
+        "wake": make_chime('wake.wav', [587.33, 880.0], [0.08, 0.15]),
+        "done": make_chime('done.wav', [880.0, 1174.66], [0.06, 0.14]),
+        "cancel": make_chime('cancel.wav', [659.25, 440.0], [0.07, 0.13]),
+        "toggle": make_chime('toggle.wav', [987.77], [0.09]),
+    }
+
+def play_chime(wav_path: str):
+    """Spielt einen Audio-Chime asynchron über das Windows-Audiosystem ab (Null Latenz)."""
+    if wav_path and os.path.exists(wav_path):
+        try:
+            winsound.PlaySound(wav_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return
+        except Exception:
+            pass
+
 class VoiceEngine:
     def __init__(self):
         self.config = load_config()
         self.is_muted = False
+        self.sounds = ensure_sound_effects()
         
-        # Status für Prompt-Aufnahme
+        # Status für Prompt-Aufnahme & Focus Memory
         self.is_recording_prompt = False
         self.has_started_speaking = False
         self.voice_chunk_count = 0
@@ -90,49 +137,118 @@ class VoiceEngine:
         self.prompt_audio_chunks = []
         self.silence_threshold = 480
         self.is_processing = False
+        self.focused_session_window = None
 
         # Vosk Initialisierung
         print("[*] Lade Vosk Sprachmodell (KWS)...")
         vosk.SetLogLevel(-1)
         self.vosk_model = vosk.Model(lang="en-us")
 
-        # Exakte Phrase 'Hey Agy'
-        self.triggers = ["hey a g", "hey a g i"]
-        grammar = json.dumps(self.triggers + ["[unk]"])
+        # Exakte Phrasen für Wake Word und Abort (Hands-Free Stop)
+        self.wake_triggers = ["hey a g", "hey a g i"]
+        self.stop_triggers = ["hey a g stop", "stop a g", "hey a g cancel", "cancel a g"]
+        self.all_triggers = self.wake_triggers + self.stop_triggers
+        grammar = json.dumps(self.all_triggers + ["[unk]"])
         self.recognizer = vosk.KaldiRecognizer(self.vosk_model, 16000, grammar)
-        print("[+] Vosk bereit. Hört auf 'Hey Agy'.")
+        print("[+] Vosk bereit. Hört auf 'Hey Agy' und 'Stop Agy'.")
 
     def chime_wake(self):
-        try:
-            winsound.Beep(1200, 120)
-            winsound.Beep(1600, 140)
-        except Exception:
-            pass
+        play_chime(self.sounds.get("wake"))
 
     def chime_done(self):
-        try:
-            winsound.Beep(1400, 110)
-            winsound.Beep(1000, 110)
-        except Exception:
-            pass
+        play_chime(self.sounds.get("done"))
+
+    def chime_cancel(self):
+        play_chime(self.sounds.get("cancel"))
 
     def chime_toggle(self, active: bool):
-        try:
-            if active:
-                winsound.Beep(1500, 120)
-            else:
-                winsound.Beep(600, 220)
-        except Exception:
-            pass
+        play_chime(self.sounds.get("toggle"))
 
-    def check_vosk_trigger(self, audio_bytes: bytes) -> bool:
+    def check_vosk_trigger(self, audio_bytes: bytes):
         if self.recognizer.AcceptWaveform(audio_bytes):
             res = json.loads(self.recognizer.Result())
             text = res.get("text", "").strip()
-            if text in self.triggers:
-                self.recognizer.Reset()
-                return True
-        return False
+            self.recognizer.Reset()
+            if text in self.stop_triggers:
+                return "stop"
+            elif text in self.wake_triggers:
+                return "wake"
+        return None
+
+    def capture_focus_memory(self):
+        """Smart Focus Memory: Merkt sich das Fenster, in dem der User gerade arbeitet."""
+        self.focused_session_window = None
+        try:
+            fg_hwnd = win32gui.GetForegroundWindow()
+            if not fg_hwnd:
+                return
+            _, fg_pid = win32process.GetWindowThreadProcessId(fg_hwnd)
+            sessions = get_antigravity_sessions()
+            for s in sessions:
+                if fg_pid in s['pids']:
+                    import pygetwindow as gw
+                    for w in gw.getAllWindows():
+                        if w._hWnd == fg_hwnd:
+                            self.focused_session_window = w
+                            print(f"[*] Smart Focus Memory: Aktive Session \"{s['workspace']}\" fixiert.")
+                            return
+        except Exception:
+            pass
+
+    def resolve_target_window(self):
+        """Findet das Zielterminal: Priorisiert das gemerkte Fokus-Fenster, sonst die aktivste Session."""
+        if self.focused_session_window:
+            try:
+                if win32gui.IsWindow(self.focused_session_window._hWnd):
+                    return self.focused_session_window
+            except Exception:
+                pass
+
+        sessions = get_antigravity_sessions()
+        if sessions:
+            primary_session = sessions[0]
+            try:
+                import pygetwindow as gw
+                for w in gw.getAllWindows():
+                    if "voice daemon" in w.title.lower() or "start_voice" in w.title.lower():
+                        continue
+                    try:
+                        _, w_pid = win32process.GetWindowThreadProcessId(w._hWnd)
+                        if w_pid in primary_session['pids']:
+                            return w
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return None
+
+    def handle_stop_command(self):
+        """Bricht einen laufenden Task / Generierung hands-free per Ctrl+C ab."""
+        print("\n" + "=" * 55)
+        print(" [!] 'Stop Agy' erkannt! Sende Abbruch (Ctrl+C)...")
+        print("=" * 55)
+        self.chime_cancel()
+
+        self.is_recording_prompt = False
+        self.prompt_audio_chunks = []
+
+        target_window = self.resolve_target_window()
+        if target_window:
+            try:
+                pyautogui.press('alt')
+                time.sleep(0.04)
+                if hasattr(target_window, 'activate'):
+                    target_window.activate()
+                else:
+                    win32gui.SetForegroundWindow(target_window._hWnd)
+                time.sleep(0.08)
+            except Exception:
+                pass
+
+        pyautogui.keyDown('ctrl')
+        pyautogui.press('c')
+        pyautogui.keyUp('ctrl')
+        print("[+] Abbruch-Signal (Ctrl+C) erfolgreich gesendet.\n")
 
     async def transcribe_live_api(self, audio_bytes: bytes, sample_rate: int = 16000) -> str:
         api_key = self.config.get("gemini_api_key")
@@ -238,38 +354,19 @@ class VoiceEngine:
 
             print(f"\n[+] Bereinigter Prompt: \"{transcribed_text}\"\n")
 
-            # 1. Antigravity KI-Sessions ermitteln (direkt über agy-real Prozessbaum!)
-            sessions = get_antigravity_sessions()
-            target_window = None
-
-            if sessions:
-                # Wähle die primäre / aktivste Session
-                target_session = sessions[0]
-                print(f"[*] Aktive KI-Session adressiert: Workspace \"{target_session['workspace']}\" (PID: {target_session['pid']})")
-
-                # Fenster der Session finden
-                try:
-                    import pygetwindow as gw
-                    for w in gw.getAllWindows():
-                        # Ignoriere unser eigenes Voice-Daemon-Fenster
-                        if "voice daemon" in w.title.lower() or "start_voice" in w.title.lower():
-                            continue
-                        try:
-                            _, w_pid = win32process.GetWindowThreadProcessId(w._hWnd)
-                            if w_pid in target_session['pids']:
-                                target_window = w
-                                break
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+            # 1. Ziel-Fenster via Smart Focus Memory auflösen
+            target_window = self.resolve_target_window()
 
             if target_window:
-                print(f"[*] Aktiviere Terminal-Fenster: \"{target_window.title}\"")
                 try:
+                    title = target_window.title if hasattr(target_window, 'title') else win32gui.GetWindowText(target_window._hWnd)
+                    print(f"[*] Aktiviere Terminal-Fenster: \"{title}\"")
                     pyautogui.press('alt')
                     time.sleep(0.04)
-                    target_window.activate()
+                    if hasattr(target_window, 'activate'):
+                        target_window.activate()
+                    else:
+                        win32gui.SetForegroundWindow(target_window._hWnd)
                     time.sleep(0.12)
                 except Exception:
                     pass
@@ -297,7 +394,10 @@ class VoiceEngine:
         print(f"\n=======================================================")
         print(f" Antigravity Voice Companion Daemon AKTIV")
         print(f" • Wake Word: 'Hey Agy' (Vosk KWS)")
+        print(f" • Stop/Abort: 'Stop Agy' / 'Hey Agy Stop' (Ctrl+C)")
         print(f" • Transkription: Gemini 3.5 Transcribe Live (Option B)")
+        print(f" • Smart Focus: Automatische Session-Erkennung aktiv")
+        print(f" • Audio-Feedback: Studio-Chimes aktiv")
         print(f" • Mute Status: {'Stummgeschaltet' if self.is_muted else 'Lauscht'}")
         print(f" • Steuerung im Chat: /voice on | /voice off | /dictate")
         print(f"=======================================================")
@@ -316,6 +416,7 @@ class VoiceEngine:
             while True:
                 if self.trigger_manual_dictate:
                     self.trigger_manual_dictate = False
+                    self.capture_focus_memory()
                     self.is_recording_prompt = True
                     self.has_started_speaking = True
                     self.voice_chunk_count = 0
@@ -323,7 +424,7 @@ class VoiceEngine:
                     self.last_voice_time = time.time()
                     self.record_start_time = time.time()
                     self.chime_wake()
-                    time.sleep(0.3)
+                    time.sleep(0.25)
                     print("[*] Manueller Diktat-Modus aktiv. Sprich jetzt...")
 
                 data, _ = stream.read(chunk_size)
@@ -332,6 +433,15 @@ class VoiceEngine:
                 rms = np.sqrt(np.mean(audio_chunk.astype(np.float64)**2))
 
                 if self.is_recording_prompt:
+                    # Hands-free Cancel währen Prompt-Aufnahme
+                    stop_trigger = self.check_vosk_trigger(audio_bytes)
+                    if stop_trigger == "stop":
+                        print("[*] Prompt-Aufnahme hands-free abgebrochen (Cancel).")
+                        self.chime_cancel()
+                        self.is_recording_prompt = False
+                        self.prompt_audio_chunks = []
+                        continue
+
                     self.prompt_audio_chunks.append(audio_chunk)
 
                     if not self.has_started_speaking:
@@ -345,6 +455,7 @@ class VoiceEngine:
 
                         if (time.time() - self.record_start_time) > 5.0:
                             print("[*] Timeout: Kein Prompt nach Wake-Word gesprochen.")
+                            self.chime_cancel()
                             self.is_recording_prompt = False
                             self.prompt_audio_chunks = []
                     else:
@@ -360,10 +471,14 @@ class VoiceEngine:
                             threading.Thread(target=self.process_and_type, args=(full_audio, sample_rate), daemon=True).start()
 
                 elif not self.is_muted:
-                    if self.check_vosk_trigger(audio_bytes):
+                    trigger = self.check_vosk_trigger(audio_bytes)
+                    if trigger == "stop":
+                        self.handle_stop_command()
+                    elif trigger == "wake":
                         print("[+] 'Hey Agy' erkannt! Öffne Mikrofon für Prompt...")
+                        self.capture_focus_memory()
                         self.chime_wake()
-                        time.sleep(0.3)
+                        time.sleep(0.25)
                         self.is_recording_prompt = True
                         self.has_started_speaking = False
                         self.voice_chunk_count = 0
@@ -405,6 +520,10 @@ class VoiceHTTPHandler(BaseHTTPRequestHandler):
         elif "/dictate" in path or "/listen" in path:
             self.engine.trigger_manual_dictate = True
             response_data = {"status": "listening"}
+
+        elif "/stop" in path or "/cancel" in path or "/abort" in path:
+            self.engine.handle_stop_command()
+            response_data = {"status": "stopped"}
 
         elif "/status" in path:
             response_data = {
