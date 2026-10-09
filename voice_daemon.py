@@ -97,7 +97,7 @@ def ensure_sound_effects():
             env[attack:] = np.exp(-3.5 * np.linspace(0, 1, decay))
             audio.append(wave_data * env)
         full = np.concatenate(audio)
-        full = (full / np.max(np.abs(full)) * 28000).astype(np.int16)
+        full = (full / np.max(np.abs(full)) * 12000).astype(np.int16)
         with wave.open(path, 'wb') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
@@ -474,14 +474,17 @@ class VoiceEngine:
                 if self.trigger_manual_dictate:
                     self.trigger_manual_dictate = False
                     self.capture_focus_memory()
+                    self.chime_wake()
+                    time.sleep(0.3)
+                    # Audiopuffer leeren, damit kein Chime-Nachhall aufgenommen wird
+                    while stream.read_available > 0:
+                        stream.read(min(stream.read_available, chunk_size))
                     self.is_recording_prompt = True
                     self.has_started_speaking = True
                     self.voice_chunk_count = 0
                     self.prompt_audio_chunks = []
                     self.last_voice_time = time.time()
                     self.record_start_time = time.time()
-                    self.chime_wake()
-                    time.sleep(0.25)
                     print("[*] Manueller Diktat-Modus aktiv. Sprich jetzt...")
 
                 data, _ = stream.read(chunk_size)
@@ -490,7 +493,7 @@ class VoiceEngine:
                 rms = np.sqrt(np.mean(audio_chunk.astype(np.float64)**2))
 
                 if self.is_recording_prompt:
-                    # Hands-free Cancel währen Prompt-Aufnahme
+                    # Hands-free Cancel während Prompt-Aufnahme
                     stop_trigger = self.check_vosk_trigger(audio_bytes)
                     if stop_trigger == "stop":
                         print("[*] Prompt-Aufnahme hands-free abgebrochen (Cancel).")
@@ -510,7 +513,7 @@ class VoiceEngine:
                         else:
                             self.voice_chunk_count = 0
 
-                        if (time.time() - self.record_start_time) > 5.0:
+                        if (time.time() - self.record_start_time) > 6.0:
                             print("[*] Timeout: Kein Prompt nach Wake-Word gesprochen.")
                             self.chime_cancel()
                             self.is_recording_prompt = False
@@ -519,7 +522,7 @@ class VoiceEngine:
                         if rms > self.silence_threshold:
                             self.last_voice_time = time.time()
 
-                        if (time.time() - self.last_voice_time) > silence_limit and len(self.prompt_audio_chunks) > 20:
+                        if (time.time() - self.last_voice_time) > silence_limit and len(self.prompt_audio_chunks) > 25:
                             self.is_recording_prompt = False
                             self.chime_done()
                             print("[*] Aufnahme beendet. Streame an Gemini 3.5 Transcribe Live...")
@@ -535,7 +538,10 @@ class VoiceEngine:
                         print("[+] 'Hey Agy' erkannt! Öffne Mikrofon für Prompt...")
                         self.capture_focus_memory()
                         self.chime_wake()
-                        time.sleep(0.25)
+                        time.sleep(0.32)
+                        # Audiopuffer vollständig leeren, damit Chime-Schallwellen nicht als Sprache fehlgedeutet werden!
+                        while stream.read_available > 0:
+                            stream.read(min(stream.read_available, chunk_size))
                         self.is_recording_prompt = True
                         self.has_started_speaking = False
                         self.voice_chunk_count = 0
