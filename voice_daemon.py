@@ -121,6 +121,22 @@ def play_chime(wav_path: str):
         except Exception:
             pass
 
+def is_daemon_window(w_hwnd: int, title: str = "") -> bool:
+    """Prüft, ob ein Fenster zu unserem eigenen Voice-Daemon gehört."""
+    title_lower = (title or win32gui.GetWindowText(w_hwnd)).lower()
+    if any(k in title_lower for k in ["voice daemon", "start_voice", "voice_daemon"]):
+        return True
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(w_hwnd)
+        my_proc = psutil.Process(os.getpid())
+        if pid == my_proc.pid:
+            return True
+        if my_proc.parent() and pid == my_proc.parent().pid:
+            return True
+    except Exception:
+        pass
+    return False
+
 class VoiceEngine:
     def __init__(self):
         self.config = load_config()
@@ -175,12 +191,13 @@ class VoiceEngine:
                 return "wake"
         return None
 
+
     def capture_focus_memory(self):
-        """Smart Focus Memory: Merkt sich das Fenster, in dem der User gerade arbeitet."""
+        """Smart Focus Memory: Merkt sich das KI-Terminal, in dem der User arbeitet (schließt den Daemon selbst strikt aus)."""
         self.focused_session_window = None
         try:
             fg_hwnd = win32gui.GetForegroundWindow()
-            if not fg_hwnd:
+            if not fg_hwnd or is_daemon_window(fg_hwnd):
                 return
             _, fg_pid = win32process.GetWindowThreadProcessId(fg_hwnd)
             sessions = get_antigravity_sessions()
@@ -189,9 +206,10 @@ class VoiceEngine:
                     import pygetwindow as gw
                     for w in gw.getAllWindows():
                         if w._hWnd == fg_hwnd:
-                            self.focused_session_window = w
-                            print(f"[*] Smart Focus Memory: Aktive Session \"{s['workspace']}\" fixiert.")
-                            return
+                            if not is_daemon_window(w._hWnd, w.title):
+                                self.focused_session_window = w
+                                print(f"[*] Smart Focus Memory: Aktive KI-Session \"{s['workspace']}\" ({w.title}) fixiert.")
+                                return
         except Exception:
             pass
 
@@ -200,7 +218,8 @@ class VoiceEngine:
         if self.focused_session_window:
             try:
                 if win32gui.IsWindow(self.focused_session_window._hWnd):
-                    return self.focused_session_window
+                    if not is_daemon_window(self.focused_session_window._hWnd, self.focused_session_window.title):
+                        return self.focused_session_window
             except Exception:
                 pass
 
@@ -210,7 +229,7 @@ class VoiceEngine:
             try:
                 import pygetwindow as gw
                 for w in gw.getAllWindows():
-                    if "voice daemon" in w.title.lower() or "start_voice" in w.title.lower():
+                    if is_daemon_window(w._hWnd, w.title):
                         continue
                     try:
                         _, w_pid = win32process.GetWindowThreadProcessId(w._hWnd)
