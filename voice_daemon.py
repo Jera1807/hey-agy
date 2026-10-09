@@ -155,6 +155,17 @@ class VoiceEngine:
         self.is_processing = False
         self.focused_session_window = None
 
+        # API-Key Validierung
+        api_key = self.config.get("gemini_api_key", "").strip()
+        if not api_key or api_key == "YOUR_GEMINI_API_KEY_HERE":
+            print("\n" + "=" * 60)
+            print(" [!] HINWEIS: Kein Gemini API-Key in config.json hinterlegt!")
+            print("     Hol dir einen kostenlosen Key auf: https://aistudio.google.com/app/apikey")
+            print("     und trage ihn in config.json ein.")
+            print("=" * 60 + "\n")
+            time.sleep(4)
+            sys.exit(1)
+
         # Vosk Initialisierung
         print("[*] Lade Vosk Sprachmodell (KWS)...")
         vosk.SetLogLevel(-1)
@@ -389,7 +400,19 @@ class VoiceEngine:
                 except Exception:
                     pass
             else:
+                sessions = get_antigravity_sessions()
+                if not sessions:
+                    print("[!] Keine laufende Antigravity-Session gefunden! Starte zuerst 'agy'.")
+                    self.chime_cancel()
+                    return
                 print("[*] Sende Prompt an aktives Eingabefeld.")
+
+            # Vorherigen Inhalt der Zwischenablage sichern
+            old_clipboard = ""
+            try:
+                old_clipboard = pyperclip.paste()
+            except Exception:
+                pass
 
             # Text direkt in das Terminal einfügen und absenden
             pyperclip.copy(transcribed_text)
@@ -401,6 +424,14 @@ class VoiceEngine:
             if self.config.get("auto_send", True):
                 time.sleep(0.12)
                 pyautogui.press('enter')
+
+            # Vorherigen Inhalt der Zwischenablage nach kurzer Pause wiederherstellen
+            if old_clipboard:
+                time.sleep(0.2)
+                try:
+                    pyperclip.copy(old_clipboard)
+                except Exception:
+                    pass
         finally:
             self.is_processing = False
 
@@ -412,7 +443,7 @@ class VoiceEngine:
         print(f"\n=======================================================")
         print(f" Antigravity Voice Companion Daemon AKTIV")
         print(f" • Wake Word: 'Hey Agy' (Vosk KWS)")
-        print(f" • Stop/Abort: 'Stop Agy' / 'Hey Agy Stop' (Ctrl+C)")
+        print(f" • Stop/Abort: 'Stop Agy' / 'Hey Agy Stop' (Escape)")
         print(f" • Transkription: Gemini 3.5 Transcribe Live (Option B)")
         print(f" • Smart Focus: Automatische Session-Erkennung aktiv")
         print(f" • Audio-Feedback: Studio-Chimes aktiv")
@@ -430,7 +461,15 @@ class VoiceEngine:
             print("[!] Keine laufende Antigravity-Session gefunden. Starte zuerst 'agy'.")
         print("=======================================================\n")
 
-        with sd.InputStream(samplerate=sample_rate, channels=1, dtype='int16', blocksize=chunk_size) as stream:
+        try:
+            stream_ctx = sd.InputStream(samplerate=sample_rate, channels=1, dtype='int16', blocksize=chunk_size)
+        except Exception as e:
+            print(f"\n[!] FEHLER beim Öffnen des Mikrofons: {e}")
+            print("    Bitte überprüfe deine Audioeingabe-Einstellungen in Windows.\n")
+            time.sleep(5)
+            return
+
+        with stream_ctx as stream:
             while True:
                 if self.trigger_manual_dictate:
                     self.trigger_manual_dictate = False
