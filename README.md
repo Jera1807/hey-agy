@@ -1,5 +1,9 @@
 # 🎙️ Hey Agy — "Hey Siri" for AI Agents
 
+<video src="demo/hey_agy_demo.mp4" controls width="720"></video>
+
+[Demo video (MP4)](demo/hey_agy_demo.mp4)
+
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Gemini 3.5 Live](https://img.shields.io/badge/Gemini%203.5-Transcribe%20Live-brightgreen.svg)](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe)
 [![Vosk](https://img.shields.io/badge/Vosk-offline%20wake%20word-orange.svg)](https://alphacephei.com/vosk/)

@@ -16,6 +16,8 @@
   ],
   "wake_phrases": [],
   "target_mode": "auto",
+  "target_apps": [],
+  "exclude_window_titles": [],
   "stop_key": "escape",
   "input_device": "",
   "tray_icon": true,

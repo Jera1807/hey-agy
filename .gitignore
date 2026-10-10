@@ -18,10 +18,13 @@ __pycache__/
 model/
 vosk-model-*/
 
-# Temporary audio files and logs
+# Temporary audio files, video captures and logs
 *.wav
 *.pcm
 *.log
+*.mp4
+*.mkv
+!demo/hey_agy_demo.mp4
 logs/
 
 # Editor / IDE configurations
