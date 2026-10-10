@@ -1,0 +1,12 @@
+# Auto-detect text files and normalize line endings
+* text=auto
+
+# Windows batch files require CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Python, Markdown, and configuration files use LF
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.txt text eol=lf

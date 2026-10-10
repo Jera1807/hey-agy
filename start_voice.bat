@@ -1,12 +1,12 @@
 @echo off
-title Antigravity Voice Daemon
+title Hey Agy - Voice Daemon
 cd /d "%~dp0"
 
 echo =======================================================
-echo   Antigravity Voice Companion Daemon
-echo   - Wake Word: Hey Agy (Local Vosk Grammar-Lock)
-echo   - Transcribe: Gemini 3.5 Transcribe Live (Option B)
-echo   - IPC Server: http://127.0.0.1:8765
+echo   Hey Agy - Voice Companion for Google Antigravity
+echo   - Wake word:     Hey Agy (offline Vosk spotting)
+echo   - Transcription: Gemini 3.5 Transcribe Live
+echo   - Control API:   http://127.0.0.1:8765
 echo =======================================================
 echo.
 
@@ -18,6 +18,6 @@ if exist "venv\Scripts\python.exe" (
 
 if %ERRORLEVEL% NEQ 0 (
     echo.
-    echo [!] Der Prozess wurde mit einem Fehler oder Warnung beendet.
+    echo [!] The daemon exited with an error or warning.
     pause
 )

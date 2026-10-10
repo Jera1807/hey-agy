@@ -1,5 +1,7 @@
 # Secret configuration containing API keys
 config.json
+.env
+.env.*
 
 # Python virtual environment
 venv/
@@ -20,6 +22,7 @@ vosk-model-*/
 *.wav
 *.pcm
 *.log
+logs/
 
 # Editor / IDE configurations
 .vscode/

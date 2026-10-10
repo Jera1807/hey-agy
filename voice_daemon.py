@@ -1,10 +1,10 @@
 import asyncio
-import io
+import concurrent.futures
 import json
-import math
 import os
-import re
+import queue
 import sys
+import tempfile
 import threading
 import time
 import wave
@@ -27,6 +27,471 @@ from google.genai import types
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 
+# Default custom vocabulary that biases transcription towards developer terms.
+# Override it with "custom_vocabulary" in config.json (up to ~100 terms work best).
+DEFAULT_VOCAB = [
+    "Antigravity", "Agy", "Gemini", "Python", "TypeScript", "JavaScript", "Rust",
+    "React", "Tailwind", "Kubernetes", "GitHub", "WebGPU", "refactor", "pull request",
+]
+
+# Apps (process names) that are treated as AI-agent targets in the default "auto" mode.
+# Override with "target_apps" in config.json, or set "target_mode": "focused" to accept any window.
+DEFAULT_TARGET_APPS = [
+    "windowsterminal.exe", "wt.exe", "conhost.exe", "powershell.exe", "pwsh.exe", "cmd.exe",
+    "wezterm-gui.exe", "alacritty.exe", "antigravity.exe", "cursor.exe", "code.exe",
+    "code - insiders.exe", "windsurf.exe", "zed.exe", "claude.exe", "chatgpt.exe",
+]
+
+_END = object()
+_CANCEL = object()
+
+
+class CallbackInput:
+    """Callback-based microphone input (also works with WDM-KS devices that lack a blocking API).
+
+    Exposes read()/read_available like sounddevice.InputStream.
+    """
+    def __init__(self, samplerate, blocksize, device=None):
+        self.blocksize = blocksize
+        self.last_data = time.time()
+        self._q = queue.Queue(maxsize=400)
+        self._carry = np.zeros((0, 1), dtype=np.int16)
+        self.device = device
+        self._stream = sd.InputStream(
+            samplerate=samplerate, channels=1, dtype="int16",
+            blocksize=0, device=device, callback=self._cb,
+        )
+        self.device = self._stream.device
+
+    @property
+    def stalled(self):
+        return (time.time() - self.last_data) > 2.0
+
+    def _cb(self, indata, frames, time_info, status):
+        self.last_data = time.time()
+        try:
+            self._q.put_nowait(indata.copy())
+        except queue.Full:
+            pass
+
+    @property
+    def read_available(self):
+        return self._carry.shape[0] + sum(b.shape[0] for b in list(self._q.queue))
+
+    def read(self, n):
+        while self._carry.shape[0] < n:
+            try:
+                self._carry = np.concatenate([self._carry, self._q.get(timeout=1.0)])
+            except queue.Empty:
+                # No data from the driver: feed silence so the main loop keeps running.
+                self._carry = np.concatenate([self._carry, np.zeros((n, 1), dtype=np.int16)])
+        out, self._carry = self._carry[:n], self._carry[n:]
+        return out, False
+
+    def __enter__(self):
+        self._stream.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stream.stop()
+        self._stream.close()
+
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(APP_DIR, "logs")
+LOG_PATH = os.path.join(LOG_DIR, "daemon.log")
+TASK_NAME = "HeyAgyVoice"
+
+
+class _Tee:
+    """Write to the log file with a timestamp per line (and to the original console if there is one)."""
+    def __init__(self, log, console=None):
+        self.log, self.console, self._at_line_start = log, console, True
+
+    def write(self, text):
+        if self.console:
+            try:
+                self.console.write(text)
+            except Exception:
+                pass
+        for chunk in text.splitlines(True):
+            if self._at_line_start and chunk.strip():
+                self.log.write(time.strftime("%Y-%m-%d %H:%M:%S "))
+            self.log.write(chunk)
+            self._at_line_start = chunk.endswith("\n")
+        self.log.flush()
+
+    def flush(self):
+        try:
+            self.log.flush()
+            if self.console:
+                self.console.flush()
+        except Exception:
+            pass
+
+
+def setup_logging(background: bool):
+    """Log to logs/daemon.log. In background mode (no console) stdout/stderr are fully redirected."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    try:
+        if os.path.getsize(LOG_PATH) > 1_000_000:
+            os.replace(LOG_PATH, LOG_PATH + ".1")
+    except OSError:
+        pass
+    log = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+    console = None if (background or sys.stdout is None) else sys.stdout
+    sys.stdout = sys.stderr = _Tee(log, console)
+
+
+def show_message(title: str, text: str):
+    """Show a Windows message box (used in background mode where no console is visible)."""
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, text, title, 0x10)
+    except Exception:
+        pass
+
+
+def _task_python() -> str:
+    exe = sys.executable
+    pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    return pyw if os.path.exists(pyw) else exe
+
+
+def _powershell(script: str):
+    import subprocess
+    return subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, text=True, errors="replace",
+    )
+
+
+def install_autostart():
+    """Register a per-user scheduled task that starts the daemon hidden at logon (no admin needed)."""
+    q = lambda p: p.replace("'", "''")
+    script = (
+        f"$a = New-ScheduledTaskAction -Execute '{q(_task_python())}' "
+        f"-Argument '\"{q(os.path.join(APP_DIR, 'voice_daemon.py'))}\" --background' "
+        f"-WorkingDirectory '{q(APP_DIR)}';"
+        "$t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME; $t.Delay = 'PT15S';"
+        "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
+        "-ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew;"
+        f"Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $a -Trigger $t -Settings $s "
+        "-Description 'Hey Agy voice companion for Google Antigravity' -Force | Out-Null"
+    )
+    r = _powershell(script)
+    if r.returncode == 0:
+        print(f"[+] Autostart installed: '{TASK_NAME}' starts the daemon hidden ~15 s after you log in.")
+        print(f"    Logs: {LOG_PATH}")
+        print("    Start it right now with:  schtasks /Run /TN " + TASK_NAME)
+    else:
+        print(f"[!] Could not install autostart: {(r.stderr or r.stdout).strip()}")
+    return r.returncode == 0
+
+
+def uninstall_autostart():
+    r = _powershell(f"Unregister-ScheduledTask -TaskName '{TASK_NAME}' -Confirm:$false -ErrorAction Stop")
+    if r.returncode == 0:
+        print(f"[+] Autostart removed ('{TASK_NAME}').")
+    else:
+        print("[*] Autostart was not installed (nothing to remove).")
+    return r.returncode == 0
+
+
+def autostart_status() -> bool:
+    r = _powershell(f"(Get-ScheduledTask -TaskName '{TASK_NAME}' -ErrorAction Stop).State")
+    ok = r.returncode == 0
+    print(f"Autostart: {'installed (' + r.stdout.strip() + ')' if ok else 'not installed'}")
+    return ok
+
+
+class TrayIcon:
+    """System-tray icon: shows the daemon state and offers mute / dictate / log / quit."""
+    COLORS = {
+        "listening": (46, 160, 67),
+        "recording": (218, 54, 51),
+        "processing": (210, 153, 34),
+        "muted": (110, 118, 129),
+    }
+    LABELS = {
+        "listening": "listening for 'Hey Agy'",
+        "recording": "recording your prompt",
+        "processing": "transcribing",
+        "muted": "muted",
+    }
+
+    def __init__(self, engine):
+        import pystray
+        from PIL import Image, ImageDraw
+        self._pystray, self._Image, self._Draw = pystray, Image, ImageDraw
+        self.engine = engine
+        self._images = {k: self._make_image(c) for k, c in self.COLORS.items()}
+        self._state = self._current_state()
+        menu = pystray.Menu(
+            pystray.MenuItem(lambda item: f"Hey Agy - {self.LABELS[self._state]}", None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda item: "Unmute wake word" if self.engine.is_muted else "Mute wake word", self._toggle_mute),
+            pystray.MenuItem("Dictate now", self._dictate),
+            pystray.MenuItem("Open log", self._open_log),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", self._quit),
+        )
+        self.icon = pystray.Icon("HeyAgy", self._images[self._state], "Hey Agy", menu)
+
+    def _make_image(self, color):
+        size = 64
+        img = self._Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        d = self._Draw.Draw(img)
+        d.ellipse((2, 2, size - 2, size - 2), fill=color + (255,))
+        white = (255, 255, 255, 255)
+        d.rounded_rectangle((25, 13, 39, 36), radius=7, fill=white)       # microphone capsule
+        d.arc((19, 24, 45, 46), start=0, end=180, fill=white, width=3)     # holder
+        d.line((32, 46, 32, 52), fill=white, width=3)                      # stand
+        d.line((25, 52, 39, 52), fill=white, width=3)
+        return img
+
+    def _current_state(self):
+        e = self.engine
+        if e.is_recording_prompt:
+            return "recording"
+        if e.is_processing:
+            return "processing"
+        return "muted" if e.is_muted else "listening"
+
+    def _toggle_mute(self, icon=None, item=None):
+        self.engine.is_muted = not self.engine.is_muted
+        self.engine.chime_toggle(not self.engine.is_muted)
+        print(f"[*] Wake word {'muted' if self.engine.is_muted else 'active'} (tray).")
+
+    def _dictate(self, icon=None, item=None):
+        self.engine.trigger_manual_dictate = True
+
+    def _open_log(self, icon=None, item=None):
+        try:
+            os.startfile(LOG_PATH)
+        except Exception as e:
+            print(f"[!] Could not open the log: {e}")
+
+    def _quit(self, icon=None, item=None):
+        print("[*] Quit requested from the tray icon.")
+        try:
+            self.icon.stop()
+        finally:
+            os._exit(0)
+
+    def _watch(self):
+        while True:
+            state = self._current_state()
+            if state != self._state:
+                self._state = state
+                try:
+                    self.icon.icon = self._images[state]
+                    self.icon.title = f"Hey Agy - {self.LABELS[state]}"
+                    self.icon.update_menu()
+                except Exception:
+                    pass
+            time.sleep(0.4)
+
+    def start(self):
+        self.icon.title = f"Hey Agy - {self.LABELS[self._state]}"
+        self.icon.run_detached()
+        threading.Thread(target=self._watch, daemon=True).start()
+
+
+def refresh_audio_devices():
+    """Reload the PortAudio device list (only call while no stream is open)."""
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception as e:
+        print(f"[!] Could not refresh the audio device list: {e}")
+
+
+class DefaultMicWatcher:
+    """Reads the ID of the Windows default capture device (needs pycaw/comtypes, otherwise inactive)."""
+    def __init__(self):
+        self._enum = None
+        try:
+            import comtypes
+            from pycaw.pycaw import IMMDeviceEnumerator
+            from pycaw.constants import CLSID_MMDeviceEnumerator
+            self._enum = comtypes.CoCreateInstance(
+                CLSID_MMDeviceEnumerator, IMMDeviceEnumerator, comtypes.CLSCTX_INPROC_SERVER
+            )
+        except Exception:
+            print("[*] Note: 'pycaw' is not installed - automatic switching to a new default microphone is disabled.")
+
+    def get(self):
+        if not self._enum:
+            return None
+        try:
+            return self._enum.GetDefaultAudioEndpoint(1, 0).GetId()  # eCapture, eConsole
+        except Exception:
+            return None
+
+
+def install_skill():
+    """Install skill/SKILL.md as ~/.agents/skills/voice/SKILL.md with the install path filled in."""
+    src = os.path.join(APP_DIR, "skill", "SKILL.md")
+    dst_dir = os.path.join(os.path.expanduser("~"), ".agents", "skills", "voice")
+    os.makedirs(dst_dir, exist_ok=True)
+    with open(src, encoding="utf-8") as f:
+        text = f.read().replace("<INSTALL_DIR>", APP_DIR)
+    with open(os.path.join(dst_dir, "SKILL.md"), "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"[+] Skill installed to {dst_dir}")
+
+
+def find_microphone(seconds: float = 2.0):
+    """Helper command: test every input device and show its peak level while you speak."""
+    print(f"Keep speaking continuously. Testing each input device for {seconds:.0f} s ...\n")
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] < 1:
+            continue
+        api = sd.query_hostapis(d["hostapi"])["name"]
+        try:
+            rec = sd.rec(int(16000 * seconds), samplerate=16000, channels=1, dtype="int16", device=i)
+            sd.wait()
+            peak = int(np.abs(rec).max())
+            print(f"[{i:>2}] peak={peak:>6}  {d['name'][:50]}  ({api})")
+        except Exception as e:
+            print(f"[{i:>2}] n/a            {d['name'][:50]}  ({api})")
+    print("\nSet the device with a high peak as \"input_device\" (index or unique name) in config.json.")
+
+
+class LiveTranscriber:
+    """Streams microphone audio to gemini-3.5-transcribe-live while you speak.
+
+    The connection is opened on the wake word; audio is sent in 100 ms blocks.
+    When recording ends, audio_stream_end is sent (hybrid VAD), so the final
+    text is available almost immediately.
+    """
+    CHUNK_BYTES = 3200  # 100 ms @ 16 kHz, int16 mono
+    FINAL_WAIT_SECONDS = 8.0
+    IDLE_AFTER_END_SECONDS = 1.5
+
+    def __init__(self, config: dict, sample_rate: int = 16000):
+        self.config = config
+        self.sample_rate = sample_rate
+        self._q = queue.Queue()
+        self._buf = bytearray()
+        self._stop = threading.Event()
+        self._result = concurrent.futures.Future()
+        self._thread = threading.Thread(target=self._thread_main, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def push(self, data: bytes):
+        self._buf.extend(data)
+        while len(self._buf) >= self.CHUNK_BYTES:
+            self._q.put(bytes(self._buf[:self.CHUNK_BYTES]))
+            del self._buf[:self.CHUNK_BYTES]
+
+    def finish(self):
+        if self._buf:
+            self._q.put(bytes(self._buf))
+            self._buf.clear()
+        self._q.put(_END)
+
+    def cancel(self):
+        self._q.put(_CANCEL)
+
+    def result(self, timeout: float = 20.0) -> str:
+        try:
+            return self._result.result(timeout)
+        except Exception as e:
+            print(f"[!] Live API error: {e}")
+            return ""
+
+    def _thread_main(self):
+        try:
+            self._result.set_result(asyncio.run(self._run()))
+        except Exception as e:
+            self._result.set_exception(e)
+
+    def _get(self):
+        try:
+            return self._q.get(timeout=0.2)
+        except queue.Empty:
+            return None
+
+    async def _run(self) -> str:
+        cfg = self.config
+        client = genai.Client(api_key=cfg.get("gemini_api_key"))
+        live_config = types.LiveConnectConfig(
+            response_modalities=["TEXT"],
+            input_audio_transcription=types.AudioTranscriptionConfig(
+                mode=cfg.get("transcription_mode", "SMART"),
+                language_codes=cfg.get("language_codes", []),
+                custom_vocabulary=cfg.get("custom_vocabulary", DEFAULT_VOCAB),
+            ),
+        )
+        model = cfg.get("gemini_model", "models/gemini-3.5-transcribe-live")
+        mime = f"audio/pcm;rate={self.sample_rate}"
+        finals = []
+        ended = asyncio.Event()
+        done = asyncio.Event()
+        cancelled = False
+        last_recv = time.monotonic()
+
+        async with client.aio.live.connect(model=model, config=live_config) as session:
+            async def sender():
+                nonlocal cancelled
+                loop = asyncio.get_running_loop()
+                while not self._stop.is_set():
+                    item = await loop.run_in_executor(None, self._get)
+                    if item is None:
+                        continue
+                    if item is _CANCEL:
+                        cancelled = True
+                        return
+                    if item is _END:
+                        await session.send_realtime_input(audio_stream_end=True)
+                        ended.set()
+                        nonlocal_touch()
+                        return
+                    await session.send_realtime_input(audio=types.Blob(data=item, mime_type=mime))
+
+            def nonlocal_touch():
+                nonlocal last_recv
+                last_recv = time.monotonic()
+
+            async def receiver():
+                try:
+                    while True:
+                        async for resp in session.receive():
+                            sc = resp.server_content
+                            if not sc:
+                                continue
+                            tr = sc.input_transcription
+                            if tr and tr.text and tr.text.strip():
+                                finals.append(tr.text.strip())
+                                nonlocal_touch()
+                            if sc.turn_complete and ended.is_set():
+                                return
+                        await asyncio.sleep(0.05)
+                except Exception as e:
+                    print(f"[!] Live API receive error: {e}")
+                finally:
+                    done.set()
+
+            recv_task = asyncio.create_task(receiver())
+            send_task = asyncio.create_task(sender())
+            try:
+                await send_task
+                if not cancelled:
+                    deadline = time.monotonic() + self.FINAL_WAIT_SECONDS
+                    while not done.is_set() and time.monotonic() < deadline:
+                        if finals and time.monotonic() - last_recv > self.IDLE_AFTER_END_SECONDS:
+                            break
+                        await asyncio.sleep(0.05)
+            finally:
+                self._stop.set()
+                recv_task.cancel()
+
+        return "" if cancelled else " ".join(finals).strip()
+
 def load_config():
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -34,22 +499,25 @@ def load_config():
     return {
         "gemini_api_key": "",
         "gemini_model": "models/gemini-3.5-transcribe-live",
-        "gemini_fallback_model": "models/gemini-3.5-transcribe",
+        "gemini_fallback_model": "gemini-3.5-transcribe",
         "wake_word": "Hey Agy",
         "silence_duration_seconds": 1.4,
         "ipc_port": 8765,
-        "auto_send": True
+        "auto_send": True,
+        "transcription_mode": "SMART",
+        "language_codes": [],
+        "custom_vocabulary": DEFAULT_VOCAB
     }
 
 def get_antigravity_sessions():
-    """Findet alle aktiven Antigravity KI-Sessions anhand der laufenden agy-real Prozesse."""
+    """Find all active Antigravity CLI sessions by looking for running agy-real processes."""
     sessions = []
     for p in psutil.process_iter(['pid', 'name']):
         try:
             if p.info['name'] and 'agy-real' in p.info['name'].lower():
                 tree_pids = {p.pid}
                 curr = p
-                # Eltern-Prozess-Baum ermitteln (cmd.exe -> powershell.exe -> WindowsTerminal.exe)
+                # Walk the parent process tree (cmd.exe -> powershell.exe -> WindowsTerminal.exe)
                 while curr.parent() is not None:
                     try:
                         curr = curr.parent()
@@ -78,7 +546,7 @@ def get_antigravity_sessions():
 SOUNDS_DIR = os.path.join(os.path.dirname(__file__), "sounds")
 
 def ensure_sound_effects():
-    """Erstellt hochwertige WAV-Chimes (harmonische Sinus-Wellen mit exponentiellem Decay), falls nicht vorhanden."""
+    """Generate the WAV chimes (harmonic sine waves with exponential decay) if they do not exist yet."""
     os.makedirs(SOUNDS_DIR, exist_ok=True)
     def make_chime(filename, freqs, durations, sample_rate=44100):
         path = os.path.join(SOUNDS_DIR, filename)
@@ -113,7 +581,7 @@ def ensure_sound_effects():
     }
 
 def play_chime(wav_path: str):
-    """Spielt einen Audio-Chime asynchron über das Windows-Audiosystem ab (Null Latenz)."""
+    """Play a chime asynchronously through the Windows audio system (zero added latency)."""
     if wav_path and os.path.exists(wav_path):
         try:
             winsound.PlaySound(wav_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
@@ -122,7 +590,7 @@ def play_chime(wav_path: str):
             pass
 
 def is_daemon_window(w_hwnd: int, title: str = "") -> bool:
-    """Prüft, ob ein Fenster zu unserem eigenen Voice-Daemon gehört."""
+    """Return True if the window belongs to this voice daemon itself."""
     title_lower = (title or win32gui.GetWindowText(w_hwnd)).lower()
     if any(k in title_lower for k in ["voice daemon", "start_voice", "voice_daemon"]):
         return True
@@ -143,7 +611,7 @@ class VoiceEngine:
         self.is_muted = False
         self.sounds = ensure_sound_effects()
         
-        # Status für Prompt-Aufnahme & Focus Memory
+        # State for prompt recording & focus memory
         self.is_recording_prompt = False
         self.has_started_speaking = False
         self.voice_chunk_count = 0
@@ -152,32 +620,63 @@ class VoiceEngine:
         self.trigger_manual_dictate = False
         self.prompt_audio_chunks = []
         self.silence_threshold = 480
+        self.noise_floor = 150.0
         self.is_processing = False
         self.focused_session_window = None
+        self.transcriber = None
 
-        # API-Key Validierung
+        # API key validation
         api_key = self.config.get("gemini_api_key", "").strip()
         if not api_key or api_key == "YOUR_GEMINI_API_KEY_HERE":
             print("\n" + "=" * 60)
-            print(" [!] HINWEIS: Kein Gemini API-Key in config.json hinterlegt!")
-            print("     Hol dir einen kostenlosen Key auf: https://aistudio.google.com/app/apikey")
-            print("     und trage ihn in config.json ein.")
+            print(" [!] NOTE: No Gemini API key found in config.json!")
+            print("     Get a free key at: https://aistudio.google.com/app/apikey")
+            print("     and add it to config.json.")
             print("=" * 60 + "\n")
             time.sleep(4)
             sys.exit(1)
 
-        # Vosk Initialisierung
-        print("[*] Lade Vosk Sprachmodell (KWS)...")
+        # Vosk initialisation
+        print("[*] Loading Vosk speech model (wake-word spotting)...")
         vosk.SetLogLevel(-1)
         self.vosk_model = vosk.Model(lang="en-us")
 
-        # Exakte Phrasen für Wake Word und Abort (Hands-Free Stop)
+        # Exact phrases for the wake word and hands-free stop.
+        # Small, proven grammar ("agy" is not in the Vosk lexicon, so it is spelled "a g").
+        # Optional extra spellings via config.json -> "wake_extra_names" (e.g. ["a gee"]).
         self.wake_triggers = ["hey a g", "hey a g i"]
         self.stop_triggers = ["hey a g stop", "stop a g", "hey a g cancel", "cancel a g"]
+        for extra in self.config.get("wake_extra_names", []):
+            n = extra.strip().lower()
+            if n:
+                self.wake_triggers.append(f"hey {n}")
+                self.stop_triggers += [f"stop {n}", f"cancel {n}", f"hey {n} stop", f"hey {n} cancel"]
+
+        # Custom wake phrases replace the defaults, e.g. ["hey claude", "okay computer"].
+        # Every word must exist in the Vosk lexicon, otherwise the phrase is skipped with a warning.
+        custom = [p.strip().lower() for p in self.config.get("wake_phrases", []) if p and p.strip()]
+        if custom:
+            valid = []
+            for phrase in custom:
+                missing = [w for w in phrase.split() if self.vosk_model.vosk_model_find_word(w) == -1]
+                if missing:
+                    print(f"[!] Wake phrase '{phrase}' skipped - unknown to the speech model: {', '.join(missing)}")
+                else:
+                    valid.append(phrase)
+            if valid:
+                self.wake_triggers, self.stop_triggers = [], []
+                for phrase in valid:
+                    rest = phrase.split(maxsplit=1)[1] if len(phrase.split()) > 1 else phrase
+                    self.wake_triggers.append(phrase)
+                    self.stop_triggers += [f"{phrase} stop", f"{phrase} cancel", f"stop {rest}", f"cancel {rest}"]
+                self.stop_triggers += [p.strip().lower() for p in self.config.get("stop_phrases", []) if p and p.strip()]
+            else:
+                print("[!] No valid wake_phrases - falling back to 'Hey Agy'.")
+        self.wake_phrase_label = self.wake_triggers[0] if self.wake_triggers else "hey a g"
         self.all_triggers = self.wake_triggers + self.stop_triggers
         grammar = json.dumps(self.all_triggers + ["[unk]"])
         self.recognizer = vosk.KaldiRecognizer(self.vosk_model, 16000, grammar)
-        print("[+] Vosk bereit. Hört auf 'Hey Agy' und 'Stop Agy'.")
+        print(f"[+] Vosk ready. Wake phrases: {', '.join(self.wake_triggers)}")
 
     def chime_wake(self):
         play_chime(self.sounds.get("wake"))
@@ -203,29 +702,52 @@ class VoiceEngine:
         return None
 
 
+    def _window_for_hwnd(self, hwnd):
+        import pygetwindow as gw
+        for w in gw.getAllWindows():
+            if w._hWnd == hwnd and not is_daemon_window(w._hWnd, w.title):
+                return w
+        return None
+
     def capture_focus_memory(self):
-        """Smart Focus Memory: Merkt sich das KI-Terminal, in dem der User arbeitet (schließt den Daemon selbst strikt aus)."""
+        """Smart Focus Memory: remember the window you were working in when you spoke.
+
+        target_mode (config.json):
+          "auto"        - Antigravity sessions, plus windows of known AI-agent apps (see target_apps)
+          "focused"     - whatever window is focused (works with any app)
+          "antigravity" - only Antigravity sessions
+        The daemon's own window is never selected.
+        """
         self.focused_session_window = None
+        mode = str(self.config.get("target_mode", "auto")).lower()
         try:
             fg_hwnd = win32gui.GetForegroundWindow()
             if not fg_hwnd or is_daemon_window(fg_hwnd):
                 return
             _, fg_pid = win32process.GetWindowThreadProcessId(fg_hwnd)
-            sessions = get_antigravity_sessions()
-            for s in sessions:
+
+            for s in get_antigravity_sessions():
                 if fg_pid in s['pids']:
-                    import pygetwindow as gw
-                    for w in gw.getAllWindows():
-                        if w._hWnd == fg_hwnd:
-                            if not is_daemon_window(w._hWnd, w.title):
-                                self.focused_session_window = w
-                                print(f"[*] Smart Focus Memory: Aktive KI-Session \"{s['workspace']}\" ({w.title}) fixiert.")
-                                return
+                    w = self._window_for_hwnd(fg_hwnd)
+                    if w:
+                        self.focused_session_window = w
+                        print(f"[*] Smart Focus Memory: locked onto session \"{s['workspace']}\" ({w.title}).")
+                        return
+
+            if mode == "antigravity":
+                return
+            proc_name = psutil.Process(fg_pid).name().lower()
+            apps = [a.lower() for a in self.config.get("target_apps", DEFAULT_TARGET_APPS)]
+            if mode == "focused" or proc_name in apps:
+                w = self._window_for_hwnd(fg_hwnd)
+                if w:
+                    self.focused_session_window = w
+                    print(f"[*] Smart Focus Memory: locked onto {proc_name} ({w.title}).")
         except Exception:
             pass
 
     def resolve_target_window(self):
-        """Findet das Zielterminal: Priorisiert das gemerkte Fokus-Fenster, sonst die aktivste Session."""
+        """Find the target terminal: prefer the remembered focus window, otherwise the first active session."""
         if self.focused_session_window:
             try:
                 if win32gui.IsWindow(self.focused_session_window._hWnd):
@@ -253,15 +775,16 @@ class VoiceEngine:
         return None
 
     def handle_stop_command(self):
-        """Bricht einen laufenden Task / Generierung in Antigravity hands-free per Escape ab."""
+        """Abort a running task/generation in Antigravity hands-free by sending Escape."""
         print("\n" + "=" * 55)
-        print(" [!] 'Stop Agy' erkannt! Sende Abbruch (Escape)...")
+        print(" [!] 'Stop Agy' detected! Sending abort (Escape)...")
         print("=" * 55)
         self.chime_cancel()
 
         self.is_recording_prompt = False
         self.prompt_audio_chunks = []
 
+        self.capture_focus_memory()
         target_window = self.resolve_target_window()
         if target_window:
             try:
@@ -275,121 +798,91 @@ class VoiceEngine:
             except Exception:
                 pass
 
-        # In Antigravity CLI wird ein aktiver Task/Generierung sauber mit Escape abgebrochen
-        pyautogui.press('escape')
-        print("[+] Abbruch-Signal (Escape) erfolgreich gesendet.\n")
-
-    async def transcribe_live_api(self, audio_bytes: bytes, sample_rate: int = 16000) -> str:
-        api_key = self.config.get("gemini_api_key")
-        model_name = self.config.get("gemini_model", "models/gemini-3.5-transcribe-live")
-        client = genai.Client(api_key=api_key)
-
-        live_config = types.LiveConnectConfig(
-            response_modalities=["TEXT"],
-            system_instruction=types.Content(parts=[types.Part.from_text(
-                text=(
-                    "Du bist ein ultra-präziser Transkriptions-Assistent für einen Senior Graphics & Software Engineer. "
-                    "Transkribiere das gesprochene Audio (Deutsch mit englischen Fachbegriffen) exakt in Text. "
-                    "Bereinige Versprecher und Füllwörter ('ähm'). "
-                    "Achte penibel auf korrekte Groß-/Kleinschreibung und Schreibweise technischer Begriffe und Frameworks "
-                    "(z. B. HyperFrames, WebGPU, WGSL, TypeGPU, TypeScript, GSAP, Tailwind, React, Python). "
-                    "Gib AUSSCHLIESSLICH den bereinigten Text aus."
-                )
-            )])
-        )
-
-        collected_text = []
-
-        async with client.aio.live.connect(model=model_name, config=live_config) as session:
-            await session.send_realtime_input(audio=types.Blob(data=audio_bytes, mime_type=f"audio/pcm;rate={sample_rate}"))
-            await session.send_realtime_input(audio_stream_end=True)
-
-            try:
-                async with asyncio.timeout(4.0):
-                    async for resp in session.receive():
-                        sc = resp.server_content
-                        if sc:
-                            chunk_text = ""
-                            if sc.input_transcription and hasattr(sc.input_transcription, 'text') and sc.input_transcription.text:
-                                chunk_text = sc.input_transcription.text.strip()
-                            elif sc.model_turn and sc.model_turn.parts:
-                                for part in sc.model_turn.parts:
-                                    if hasattr(part, 'text') and part.text:
-                                        chunk_text += part.text.strip()
-                            if chunk_text:
-                                if not collected_text or collected_text[-1] != chunk_text:
-                                    collected_text.append(chunk_text)
-                            if sc.turn_complete or sc.generation_complete:
-                                break
-            except asyncio.TimeoutError:
-                pass
-
-        return " ".join(collected_text).strip()
+        # Escape cleanly interrupts an active generation in Antigravity and Claude Code.
+        # Other agents may use a different shortcut: set "stop_key" (e.g. "ctrl+c") in config.json.
+        stop_key = str(self.config.get("stop_key", "escape")).lower()
+        pyautogui.hotkey(*[k.strip() for k in stop_key.split("+")])
+        print(f"[+] Abort signal ({stop_key}) sent.\n")
 
     def transcribe_fallback(self, audio_data: np.ndarray, sample_rate: int = 16000) -> str:
-        api_key = self.config.get("gemini_api_key")
-        fallback_model = self.config.get("gemini_fallback_model", "models/gemini-3.5-transcribe")
-        client = genai.Client(api_key=api_key)
+        """Optional fallback via the Interactions API (gemini-3.5-transcribe, file transcription)."""
+        client = genai.Client(api_key=self.config.get("gemini_api_key"))
+        model = self.config.get("gemini_fallback_model", "gemini-3.5-transcribe").replace("models/", "")
 
-        buf = io.BytesIO()
-        with wave.open(buf, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(sample_rate)
-            wf.writeframes(audio_data.tobytes())
-        wav_bytes = buf.getvalue()
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = tmp.name
+                with wave.open(tmp, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sample_rate)
+                    wf.writeframes(audio_data.tobytes())
+            audio_file = client.files.upload(file=tmp_path, config={"mime_type": "audio/wav"})
+            interaction = client.interactions.create(
+                model=model,
+                input=[{"type": "audio", "uri": audio_file.uri, "mime_type": "audio/wav"}],
+            )
+            return (interaction.output_text or "").strip()
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
-        response = client.models.generate_content(
-            model=fallback_model,
-            contents=[
-                types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
-                "Transkribiere dieses Audio präzise für eine Entwickler-Eingabe (HyperFrames, WebGPU, TypeScript). Gib nur den bereinigten Text zurück."
-            ]
-        )
+    def start_stream(self):
+        """Open the Live API connection right at the wake word (audio is buffered meanwhile)."""
+        self.transcriber = LiveTranscriber(self.config)
+        self.transcriber.start()
 
-        parts = []
-        if response.candidates:
-            for c in response.candidates:
-                if c.content and c.content.parts:
-                    parts = [p.text for p in c.content.parts if hasattr(p, 'text') and p.text]
-        return " ".join(parts).strip() if parts else (response.text.strip() if response.text else "")
+    def cancel_stream(self):
+        if self.transcriber:
+            self.transcriber.cancel()
+            self.transcriber = None
 
-    def process_and_type(self, full_audio: np.ndarray, sample_rate: int = 16000):
+    def process_and_type(self, transcriber, full_audio: np.ndarray, sample_rate: int = 16000):
         if self.is_processing:
-            print("[*] Eine vorherige Eingabe wird noch verarbeitet. Ignoriere Doppel-Trigger.")
+            print("[*] A previous prompt is still being processed. Ignoring duplicate trigger.")
+            transcriber.cancel()
             return
 
         self.is_processing = True
         try:
-            print(f"[*] Verarbeite Prompt mit {self.config.get('gemini_model')} (Live-API)...")
-            raw_pcm = full_audio.tobytes()
-            transcribed_text = ""
-
-            try:
-                transcribed_text = asyncio.run(self.transcribe_live_api(raw_pcm, sample_rate))
-            except Exception as e:
-                print(f"[!] Live-API Fehler: {e}. Versuche Fallback...")
+            print(f"[*] Waiting for final text from {self.config.get('gemini_model')} (Live API)...")
+            transcribed_text = transcriber.result()
 
             if not transcribed_text:
-                print("[*] Nutze Fallback-Modell (Gemini 3.5 Transcribe)...")
+                print("[*] No text received - retrying with the same Live model (full audio)...")
+                try:
+                    retry = LiveTranscriber(self.config, sample_rate)
+                    retry.start()
+                    retry.push(full_audio.tobytes())
+                    retry.finish()
+                    transcribed_text = retry.result()
+                except Exception as e:
+                    print(f"[!] Live retry error: {e}")
+
+            if not transcribed_text and self.config.get("use_unary_fallback", False):
+                print("[*] Using fallback model (Gemini 3.5 Transcribe, Interactions API; small free quota)...")
                 try:
                     transcribed_text = self.transcribe_fallback(full_audio, sample_rate)
                 except Exception as e:
-                    print(f"[!] Fallback-Fehler: {e}")
+                    print(f"[!] Fallback error: {e}")
 
             if not transcribed_text:
-                print("[!] Keine Sprache im Prompt erkannt.")
+                print("[!] No speech recognised in the prompt.")
                 return
 
-            print(f"\n[+] Bereinigter Prompt: \"{transcribed_text}\"\n")
+            print(f"\n[+] Cleaned prompt: \"{transcribed_text}\"\n")
 
-            # 1. Ziel-Fenster via Smart Focus Memory auflösen
+            # 1. Resolve the target window via Smart Focus Memory
             target_window = self.resolve_target_window()
 
             if target_window:
                 try:
                     title = target_window.title if hasattr(target_window, 'title') else win32gui.GetWindowText(target_window._hWnd)
-                    print(f"[*] Aktiviere Terminal-Fenster: \"{title}\"")
+                    print(f"[*] Activating terminal window: \"{title}\"")
                     pyautogui.press('alt')
                     time.sleep(0.04)
                     if hasattr(target_window, 'activate'):
@@ -402,19 +895,20 @@ class VoiceEngine:
             else:
                 sessions = get_antigravity_sessions()
                 if not sessions:
-                    print("[!] Keine laufende Antigravity-Session gefunden! Starte zuerst 'agy'.")
+                    print("[!] No target window found! Focus your AI agent (Antigravity, Claude Code, Cursor, ...)")
+                    print("    and say the wake word again, or set \"target_mode\": \"focused\" in config.json.")
                     self.chime_cancel()
                     return
-                print("[*] Sende Prompt an aktives Eingabefeld.")
+                print("[*] Sending prompt to the active input field.")
 
-            # Vorherigen Inhalt der Zwischenablage sichern
+            # Save the previous clipboard contents
             old_clipboard = ""
             try:
                 old_clipboard = pyperclip.paste()
             except Exception:
                 pass
 
-            # Text direkt in das Terminal einfügen und absenden
+            # Paste the text into the terminal and submit it
             pyperclip.copy(transcribed_text)
             time.sleep(0.08)
             pyautogui.keyDown('ctrl')
@@ -425,7 +919,7 @@ class VoiceEngine:
                 time.sleep(0.12)
                 pyautogui.press('enter')
 
-            # Vorherigen Inhalt der Zwischenablage nach kurzer Pause wiederherstellen
+            # Restore the previous clipboard contents after a short pause
             if old_clipboard:
                 time.sleep(0.2)
                 try:
@@ -437,121 +931,206 @@ class VoiceEngine:
 
     def run(self):
         sample_rate = 16000
-        chunk_size = 800  # 50ms Chunks
+        chunk_size = 800  # 50 ms chunks
         silence_limit = self.config.get("silence_duration_seconds", 1.4)
 
-        print(f"\n=======================================================")
-        print(f" Antigravity Voice Companion Daemon AKTIV")
-        print(f" • Wake Word: 'Hey Agy' (Vosk KWS)")
-        print(f" • Stop/Abort: 'Stop Agy' / 'Hey Agy Stop' (Escape)")
-        print(f" • Transkription: Gemini 3.5 Transcribe Live (Option B)")
-        print(f" • Smart Focus: Automatische Session-Erkennung aktiv")
-        print(f" • Audio-Feedback: Studio-Chimes aktiv")
-        print(f" • Mute Status: {'Stummgeschaltet' if self.is_muted else 'Lauscht'}")
-        print(f" • Steuerung im Chat: /voice on | /voice off | /dictate")
-        print(f"=======================================================")
+        print("\n=======================================================")
+        print(" Hey Agy - Voice Companion for Google Antigravity (ACTIVE)")
+        print(" * Wake word:     'Hey Agy' (offline Vosk spotting)")
+        print(" * Stop / abort:  'Stop Agy' or 'Hey Agy Stop' (sends Escape)")
+        print(" * Transcription: Gemini 3.5 Transcribe Live")
+        print(f" * Target:        {self.config.get('target_mode', 'auto')} (the window you were in when you said the wake word)")
+        print(" * Audio cues:    chimes enabled")
+        print(f" * Status:        {'muted' if self.is_muted else 'listening'}")
+        print(" * Control:       python voice_client.py [on|off|dictate|stop|status]")
+        print("=======================================================")
 
-        # Erkannte Antigravity-Sessions anzeigen
+        # Show detected Antigravity sessions
         sessions = get_antigravity_sessions()
         if sessions:
-            print(f"[+] {len(sessions)} aktive Antigravity KI-Session(s) gefunden:")
+            print(f"[+] {len(sessions)} active Antigravity session(s) found:")
             for i, s in enumerate(sessions, 1):
                 print(f"    [{i}] Workspace: \"{s['workspace']}\" (PID {s['pid']})")
         else:
-            print("[!] Keine laufende Antigravity-Session gefunden. Starte zuerst 'agy'.")
+            print("[!] No running Antigravity session found. Start 'agy' first.")
         print("=======================================================\n")
 
-        try:
-            stream_ctx = sd.InputStream(samplerate=sample_rate, channels=1, dtype='int16', blocksize=chunk_size)
-        except Exception as e:
-            print(f"\n[!] FEHLER beim Öffnen des Mikrofons: {e}")
-            print("    Bitte überprüfe deine Audioeingabe-Einstellungen in Windows.\n")
-            time.sleep(5)
-            return
+        pinned = self.config.get("input_device")
+        if isinstance(pinned, str) and pinned.strip() == "":
+            pinned = None
+        watcher = DefaultMicWatcher()
+        first = True
 
-        with stream_ctx as stream:
-            while True:
-                if self.trigger_manual_dictate:
-                    self.trigger_manual_dictate = False
+        while True:
+            try:
+                if not first:
+                    refresh_audio_devices()
+                stream_ctx = CallbackInput(sample_rate, chunk_size, pinned)
+                dev_info = sd.query_devices(stream_ctx.device, 'input')
+                print(f"[+] Microphone: {dev_info['name']} ({sd.query_hostapis(dev_info['hostapi'])['name']})")
+            except Exception as e:
+                print(f"\n[!] ERROR opening the microphone: {e}")
+                if first:
+                    print("    Please check your Windows audio input settings.\n")
+                    time.sleep(5)
+                    return
+                print("    Retrying in 3 seconds...\n")
+                time.sleep(3)
+                continue
+            first = False
+
+            opened_id = watcher.get()
+            try:
+                with stream_ctx as stream:
+                    reason = self._listen(stream, sample_rate, chunk_size, silence_limit,
+                                          watcher, opened_id, pinned is not None)
+            except Exception as e:
+                reason = f"audio stream error: {e}"
+
+            print(f"[*] Reconnecting microphone: {reason}")
+            self.cancel_stream()
+            self.is_recording_prompt = False
+            self.prompt_audio_chunks = []
+            try:
+                self.recognizer.Reset()
+            except Exception:
+                pass
+            self.chime_toggle(True)
+            time.sleep(0.8)
+
+    def _listen(self, stream, sample_rate, chunk_size, silence_limit, watcher, opened_id, pinned):
+        """Main loop on an open microphone stream. Returns the reason why a reconnect is needed."""
+        listen_start = time.time()
+        idle_peak = 0.0
+        warned_silent = False
+        last_dev_check = time.time()
+        while True:
+            now = time.time()
+            if now - last_dev_check > 2.0:
+                last_dev_check = now
+                if stream.stalled:
+                    return "microphone stopped delivering data (device unplugged?)"
+                if not pinned and not self.is_recording_prompt and not self.is_processing:
+                    current_id = watcher.get()
+                    if current_id and opened_id and current_id != opened_id:
+                        return "default microphone changed"
+
+            if self.trigger_manual_dictate:
+                self.trigger_manual_dictate = False
+                self.capture_focus_memory()
+                self.chime_wake()
+                self.start_stream()
+                self.calibrate_silence_threshold()
+                time.sleep(0.3)
+                # Flush the audio buffer so the chime is not recorded
+                while stream.read_available > 0:
+                    stream.read(min(stream.read_available, chunk_size))
+                self.is_recording_prompt = True
+                self.has_started_speaking = True
+                self.voice_chunk_count = 0
+                self.prompt_audio_chunks = []
+                self.last_voice_time = time.time()
+                self.record_start_time = time.time()
+                print("[*] Manual dictation active. Speak now...")
+
+            data, _ = stream.read(chunk_size)
+            audio_chunk = np.frombuffer(data, dtype=np.int16)
+            audio_bytes = data.tobytes()
+            rms = np.sqrt(np.mean(audio_chunk.astype(np.float64)**2))
+
+            if self.is_recording_prompt:
+                # Hands-free cancel while recording a prompt
+                stop_trigger = self.check_vosk_trigger(audio_bytes)
+                if stop_trigger == "stop":
+                    print("[*] Prompt recording cancelled hands-free.")
+                    self.chime_cancel()
+                    self.cancel_stream()
+                    self.is_recording_prompt = False
+                    self.prompt_audio_chunks = []
+                    continue
+
+                self.prompt_audio_chunks.append(audio_chunk)
+                if self.transcriber:
+                    self.transcriber.push(audio_bytes)
+
+                if not self.has_started_speaking:
+                    if rms > self.silence_threshold:
+                        self.voice_chunk_count += 1
+                        if self.voice_chunk_count >= 3:
+                            self.has_started_speaking = True
+                            self.last_voice_time = time.time()
+                    else:
+                        self.voice_chunk_count = 0
+
+                    if (time.time() - self.record_start_time) > 6.0:
+                        print("[*] Timeout: no prompt spoken after the wake word.")
+                        self.chime_cancel()
+                        self.cancel_stream()
+                        self.is_recording_prompt = False
+                        self.prompt_audio_chunks = []
+                else:
+                    if rms > self.silence_threshold:
+                        self.last_voice_time = time.time()
+
+                    if (time.time() - self.last_voice_time) > silence_limit and len(self.prompt_audio_chunks) > 25:
+                        self.is_recording_prompt = False
+                        self.chime_done()
+                        print("[*] Recording finished. Finalising transcription (Gemini 3.5 Transcribe Live)...")
+                        full_audio = np.concatenate(self.prompt_audio_chunks)
+                        self.prompt_audio_chunks = []
+                        transcriber, self.transcriber = self.transcriber, None
+                        if transcriber:
+                            transcriber.finish()
+                            threading.Thread(target=self.process_and_type, args=(transcriber, full_audio, sample_rate), daemon=True).start()
+
+            elif not self.is_muted:
+                idle_peak = max(idle_peak, rms)
+                if not warned_silent and idle_peak < 2 and (time.time() - listen_start) > 8:
+                    warned_silent = True
+                    print("\n[!] WARNING: The microphone only delivers silence (level 0)!")
+                    print("    Check: Windows Settings > Privacy > Microphone (allow desktop apps),")
+                    print("    Sound > Input (not muted), or set \"input_device\" in config.json.")
+                    print("    Run 'python voice_daemon.py --find-mic' to list input levels.\n")
+                self.update_noise_floor(rms)
+                trigger = self.check_vosk_trigger(audio_bytes)
+                if trigger == "stop":
+                    self.handle_stop_command()
+                elif trigger == "wake":
+                    print("[+] 'Hey Agy' detected! Listening for your prompt...")
                     self.capture_focus_memory()
                     self.chime_wake()
-                    time.sleep(0.3)
-                    # Audiopuffer leeren, damit kein Chime-Nachhall aufgenommen wird
+                    self.start_stream()
+                    self.calibrate_silence_threshold()
+                    time.sleep(0.32)
+                    # Fully flush the audio buffer so the chime is not mistaken for speech
                     while stream.read_available > 0:
                         stream.read(min(stream.read_available, chunk_size))
                     self.is_recording_prompt = True
-                    self.has_started_speaking = True
+                    self.has_started_speaking = False
                     self.voice_chunk_count = 0
                     self.prompt_audio_chunks = []
-                    self.last_voice_time = time.time()
                     self.record_start_time = time.time()
-                    print("[*] Manueller Diktat-Modus aktiv. Sprich jetzt...")
+                    self.last_voice_time = time.time()
 
-                data, _ = stream.read(chunk_size)
-                audio_chunk = np.frombuffer(data, dtype=np.int16)
-                audio_bytes = data.tobytes()
-                rms = np.sqrt(np.mean(audio_chunk.astype(np.float64)**2))
+            time.sleep(0.001)
 
-                if self.is_recording_prompt:
-                    # Hands-free Cancel während Prompt-Aufnahme
-                    stop_trigger = self.check_vosk_trigger(audio_bytes)
-                    if stop_trigger == "stop":
-                        print("[*] Prompt-Aufnahme hands-free abgebrochen (Cancel).")
-                        self.chime_cancel()
-                        self.is_recording_prompt = False
-                        self.prompt_audio_chunks = []
-                        continue
 
-                    self.prompt_audio_chunks.append(audio_chunk)
+    def update_noise_floor(self, rms: float):
+        """Track the idle noise floor (speech is largely ignored)."""
+        if rms < self.noise_floor * 2 + 150:
+            self.noise_floor += 0.02 * (rms - self.noise_floor)
+        else:
+            self.noise_floor += 0.0005 * (rms - self.noise_floor)
 
-                    if not self.has_started_speaking:
-                        if rms > self.silence_threshold:
-                            self.voice_chunk_count += 1
-                            if self.voice_chunk_count >= 3:
-                                self.has_started_speaking = True
-                                self.last_voice_time = time.time()
-                        else:
-                            self.voice_chunk_count = 0
+    def calibrate_silence_threshold(self):
+        fixed = self.config.get("silence_threshold", 0)
+        if fixed and fixed > 0:
+            self.silence_threshold = fixed
+        else:
+            self.silence_threshold = int(min(1500, max(300, self.noise_floor * 2.5 + 100)))
+        print(f"[*] Speech threshold: {self.silence_threshold} (noise floor ~{int(self.noise_floor)})")
 
-                        if (time.time() - self.record_start_time) > 6.0:
-                            print("[*] Timeout: Kein Prompt nach Wake-Word gesprochen.")
-                            self.chime_cancel()
-                            self.is_recording_prompt = False
-                            self.prompt_audio_chunks = []
-                    else:
-                        if rms > self.silence_threshold:
-                            self.last_voice_time = time.time()
-
-                        if (time.time() - self.last_voice_time) > silence_limit and len(self.prompt_audio_chunks) > 25:
-                            self.is_recording_prompt = False
-                            self.chime_done()
-                            print("[*] Aufnahme beendet. Streame an Gemini 3.5 Transcribe Live...")
-                            full_audio = np.concatenate(self.prompt_audio_chunks)
-                            self.prompt_audio_chunks = []
-                            threading.Thread(target=self.process_and_type, args=(full_audio, sample_rate), daemon=True).start()
-
-                elif not self.is_muted:
-                    trigger = self.check_vosk_trigger(audio_bytes)
-                    if trigger == "stop":
-                        self.handle_stop_command()
-                    elif trigger == "wake":
-                        print("[+] 'Hey Agy' erkannt! Öffne Mikrofon für Prompt...")
-                        self.capture_focus_memory()
-                        self.chime_wake()
-                        time.sleep(0.32)
-                        # Audiopuffer vollständig leeren, damit Chime-Schallwellen nicht als Sprache fehlgedeutet werden!
-                        while stream.read_available > 0:
-                            stream.read(min(stream.read_available, chunk_size))
-                        self.is_recording_prompt = True
-                        self.has_started_speaking = False
-                        self.voice_chunk_count = 0
-                        self.prompt_audio_chunks = []
-                        self.record_start_time = time.time()
-                        self.last_voice_time = time.time()
-
-                time.sleep(0.001)
-
-# Lokale HTTP Schnittstelle
+# Local HTTP control interface
 class VoiceHTTPHandler(BaseHTTPRequestHandler):
     engine: VoiceEngine = None
 
@@ -559,9 +1138,17 @@ class VoiceHTTPHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self):
-        self.handle_request()
+        # GET is only allowed for /status so that no web page can trigger actions via a link/image.
+        if "/status" in self.path.lower():
+            self.handle_request()
+        else:
+            self.send_error(405, "Use POST")
 
     def do_POST(self):
+        # The custom header forces a CORS preflight in browsers (which is never answered).
+        if self.headers.get("X-Voice-Client") != "1":
+            self.send_error(403, "Forbidden")
+            return
         self.handle_request()
 
     def handle_request(self):
@@ -572,13 +1159,13 @@ class VoiceHTTPHandler(BaseHTTPRequestHandler):
             self.engine.is_muted = True
             self.engine.chime_toggle(False)
             response_data = {"status": "muted", "is_muted": True}
-            print("[*] Wake-Word 'Hey Agy' stummgeschaltet (MUTED).")
+            print("[*] Wake word 'Hey Agy' muted.")
 
         elif "/unmute" in path or "/on" in path:
             self.engine.is_muted = False
             self.engine.chime_toggle(True)
             response_data = {"status": "active", "is_muted": False}
-            print("[*] Wake-Word 'Hey Agy' aktiviert (ACTIVE).")
+            print("[*] Wake word 'Hey Agy' active.")
 
         elif "/dictate" in path or "/listen" in path:
             self.engine.trigger_manual_dictate = True
@@ -599,21 +1186,31 @@ class VoiceHTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(response_data).encode("utf-8"))
 
-def start_daemon():
-    # 1. Single-Instance Mutex (Verhindert doppelt geöffnete Fenster / Instanzen)
+def start_daemon(background: bool = False):
+    setup_logging(background)
+
+    # 1. Single-instance mutex (prevents duplicate daemons)
     mutex_name = "Global\\AntigravityVoiceDaemonMutex"
     mutex = win32event.CreateMutex(None, False, mutex_name)
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        if background:
+            print("[*] Another instance is already running - exiting.")
+            sys.exit(0)
         print("\n" + "=" * 60)
-        print(" [!] ACHTUNG: Antigravity Voice Daemon läuft bereits!")
-        print("     Es ist bereits eine Instanz / ein Fenster geöffnet.")
-        print("     Dieses zweite Fenster wird beendet, um doppelte")
-        print("     Spracheingaben im Terminal zu verhindern.")
+        print(" [!] WARNING: The voice daemon is already running!")
+        print("     Another instance / window is already open.")
+        print("     This second window will exit to avoid duplicate")
+        print("     voice input in your terminal.")
         print("=" * 60 + "\n")
         time.sleep(3.5)
         sys.exit(1)
 
-    engine = VoiceEngine()
+    try:
+        engine = VoiceEngine()
+    except SystemExit:
+        if background:
+            show_message("Hey Agy", "No Gemini API key found.\nAdd it to config.json and start Hey Agy again.")
+        raise
     VoiceHTTPHandler.engine = engine
 
     port = engine.config.get("ipc_port", 8765)
@@ -621,11 +1218,45 @@ def start_daemon():
         server = HTTPServer(("127.0.0.1", port), VoiceHTTPHandler)
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
         server_thread.start()
-        print(f"[+] Steuerungs-Schnittstelle aktiv auf http://127.0.0.1:{port}")
+        print(f"[+] Control interface listening on http://127.0.0.1:{port}")
     except Exception as e:
-        print(f"[!] Hinweis zur Schnittstelle auf Port {port}: {e}")
+        print(f"[!] Could not start the control interface on port {port}: {e}")
+
+    if engine.config.get("tray_icon", True):
+        try:
+            TrayIcon(engine).start()
+            print("[+] Tray icon active (right-click it for mute / dictate / log / quit).")
+        except Exception as e:
+            print(f"[*] Tray icon unavailable ({e}). Install 'pystray' and 'pillow' to enable it.")
 
     engine.run()
 
+HELP = """Hey Agy voice daemon
+
+Usage: python voice_daemon.py [option]
+
+  (no option)            run in this console
+  --background           run hidden: log to logs/daemon.log, control via the tray icon
+  --install-autostart    start hidden automatically when you log in to Windows
+  --uninstall-autostart  remove the autostart entry
+  --autostart-status     show whether autostart is installed
+  --find-mic             list input devices and their levels while you speak
+  --install-skill        install the Antigravity skill (~/.agents/skills/voice)
+"""
+
 if __name__ == "__main__":
-    start_daemon()
+    args = sys.argv[1:]
+    if "--find-mic" in args:
+        find_microphone()
+    elif "--install-autostart" in args:
+        sys.exit(0 if install_autostart() else 1)
+    elif "--uninstall-autostart" in args:
+        uninstall_autostart()
+    elif "--autostart-status" in args:
+        autostart_status()
+    elif "--install-skill" in args:
+        install_skill()
+    elif "-h" in args or "--help" in args:
+        print(HELP)
+    else:
+        start_daemon(background="--background" in args)
