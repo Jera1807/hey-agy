@@ -1,8 +1,6 @@
 # 🎙️ Hey Agy — "Hey Siri" for AI Agents
 
-<video src="demo/hey_agy_demo.mp4" controls width="720"></video>
-
-[Demo video (MP4)](demo/hey_agy_demo.mp4)
+https://github.com/user-attachments/assets/a72a6e52-09b5-4dc6-9216-db199f27efb8
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Gemini 3.5 Live](https://img.shields.io/badge/Gemini%203.5-Transcribe%20Live-brightgreen.svg)](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe)
